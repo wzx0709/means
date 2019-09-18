@@ -1,0 +1,406 @@
+#openstack裸机部署手册
+
+##系统部署
+
+###部署节点系统服务安装
+
+1. 安装系统
+
+   - 配置需求
+     ```shell
+     8核心 16G内存 100G硬盘
+     网卡：两张
+     ```
+
+   - 上传系统安装包
+     ```shell
+     ctsi_cloud_v3.1.iso   ##部署ISO
+     ```
+
+2. 系统初始化
+
+   - 登录信息
+     ```shell
+     用户名：root
+     密  码：P@ssw0rd
+     ```
+
+   - 网卡信息
+     ```shell
+     配置一张网卡，将其作为PXE网络使用
+     ```
+
+3. 配置初始化信息
+
+   - 配置节点信息
+     vi /opt/boot_setup /init.sh
+     ```shell
+     docker exec cobber cobber profile edit --name CentOS-7.4-x86_64 --kopts 'ipaddr=节点IP地址:节点掩码:节点网关:节点的主机名'
+     ```
+
+   - 初始化服务
+     ```shell
+     sh /opt/boot_setup /init.sh
+     ```
+
+   - 开启部署推送
+     ```shell
+     #开启pxe服务（cobbler）
+     docker start cobber
+     ```
+
+###节点服务部署
+
+1. 系统安装
+
+   - 配置要求
+     ```shell
+     8核心 16G内存 100G硬盘
+     网卡：两张
+     ```
+
+     ==网卡1必须与部署节点的网卡1在同一vlan，便于PXE的安装==
+
+   - 安装系统
+     ```
+     打开计算节点的服务器，等待PXE界面的出现，自行安装系统
+     ```
+
+2. 网络初始化
+
+   - IP设置
+     ```shell
+     各个节点网卡1配置IP；
+     网卡2不要配置IP（部署时候作为neutron的外部网卡使用）
+     ```
+
+   - 节点hosts配置
+     vi /etc/hosts
+     ```shell
+     192.168.52.7 deploy
+     192.168.52.8 control01
+     192.168.52.9 compute01
+     ```
+
+3. 部署前的配置
+
+   控制节点
+
+   - 修改multinode配置文件（根据实际环境进行填写）
+     ```shell
+     cp /root/kolla-ansible/ansible/inventory/multinode /root/kolla-ansible/tools
+     ```
+     vi /root/kolla-ansible/tools/multinode
+     ```shell
+     # These initial groups are the only groups required to be modified. The
+     # additional groups are for more control of the environment.
+     [control]
+     # These hostname must be resolvable from your deployment host
+     control01
+     #control02
+     #control03
+
+     # The above can also be specified as follows:
+     #control[01:03]     ansible_user=kolla
+
+     # The network nodes are where your l3-agent and loadbalancers will run
+     # This can be the same as a host in the control group
+     [network]
+     control01
+     #network01
+     #network02
+
+     [compute]
+     compute01
+
+     [monitoring]
+     control01
+     #monitoring01
+
+     # When compute nodes and control nodes use different interfaces,
+     # you can specify "api_interface" and other interfaces like below:
+     #compute01 neutron_external_interface=eth0 api_interface=em1 storage_interface=em1 tunnel_interface=em1
+
+     [storage]
+     control01
+
+     [deployment]
+     deploy       ansible_connection=local
+     ```
+
+     - 配置说明
+
+       | 键        | 值             |
+       | --------- | -------------- |
+       | control01 | 控制节点主机名 |
+       | compute01 | 计算节点主机名 |
+       | deploy    | 部署节点主机名 |
+
+### 建立本地镜像仓库
+
+1. 创建镜像目录
+
+   deploy节点
+   ```shell
+   mkdir /opt/registry/docker
+   tar -xvf ctsi_all_registry.gz -C  /opt/registry/docker
+   ```
+
+2. 配置仓库文件
+
+    所有节点
+
+   - docker.server配置文件
+     vim /usr/lib/systemd/system/docker.service
+     ```shell
+     ExecStart=/usr/bin/dockerd --insecure-registry 10.10.101.41:4000
+     ```
+
+     - 配置说明
+       | 键           | 值             |
+       | ------------ | -------------- |
+       | 10.10.101.41 | deploy部署节点 |
+
+   - 重启docker服务
+     ```shell
+     systemctl daemon-reload
+     systemctl restart docker
+     ```
+
+   - 验证查看仓库配置
+     ```shell
+     systemctl status docker
+     #是否出现/usr/bin/dockerd --insecure-registry 10.10.100.41:4000
+     ```
+
+3. 修改globals.yml
+
+   vi  /etc/kolla/globals.yml
+   ```shell
+   kolla_internal_vip_address："10.10.100.42"  #控制节点的IP
+   docker_registry："10.10.100.41:4000"  #为部署推送节点的IP
+   network_interface：eth1  #####各个节点的网卡名称必须相同
+   neutron_external_interface：eth2  #####各个节点的网卡名称必须相同
+   neutron_plugin_agent：根据测试环境所使⽤虚拟化对应选择（kvm：openvswitch， vmware： vmware_dvs 或 vmware_nsxv)
+   nova_computer-virt_type: "vmware"
+   ```
+
+   - 配置说明
+     | 键                         | 值                                                           |
+     | -------------------------- | ------------------------------------------------------------ |
+     | kolla_internal_vip_address | control01控制节点IP                                          |
+     | docker_registry            | deploy部署节点IP                                             |
+     | network_interface          | 网卡1的名称                                                  |
+     | neutron_external_interface | 网卡2的名称                                                  |
+     | neutron_plugin_agent       | 根据测试环境所使⽤虚拟化对应选择（kvm：openvswitch， vmware： vmware_dvs 或 vmware_nsxv) |
+     | nova_computer-virt_type    | vmware:vmware；kvm使⽤qemu                                   |
+
+4. 部署推送
+
+   deploy节点
+
+   - 检查各节点连通性
+     ```shell
+     cd /etc/kolla-ansible/tools
+     ansible -i multinode all -m ping
+     ```
+
+   - 拉取镜像
+     ```shell
+     ./kolla-ansible -i multinode pull
+     ```
+
+   - 执行部署
+     ```shell
+     ./kolla-ansible -i multinode deploy
+     ```
+
+   - 部署配置
+     ```shell
+     ./kolla-ansible -i multinode post-deploy
+     ```
+
+## 裸服务器实例化
+
+1. 上传解压镜像文件
+   ```shell
+   tar -xvf image.tar.gz
+   ```
+
+2. 创建镜像
+
+   - 创建kernel镜像
+     ```shell
+     glance image-create --name kernel-01 --visibility public --disk-format aki --container-format aki< ironic-agent.kernel
+     ```
+
+   - 创建ramdisk镜像
+     ```shell
+     glance image-create --name ramdisk-01 --visibility public --disk-format ari --container-format ari <ironic-agent.initramfs
+     ```
+
+   - 创建普通镜像
+     ```shell
+     glance image-create --name ironic-image --visibility public --disk-format qcow2 --container-format bare < centos7-amd64-2.qcow
+     ```
+
+3. 创建网络
+
+   - 创建一个vlan网络
+     ```shell
+     neutron net-create --tenant-id d9e1403b49ce466e974103b6c542badd --shared --provider:network_type vlan --provider:segmentation_id 3 --provider:physical_network physnet1 ironic-net
+     ```
+
+   - 创建通信子网
+     ```shell
+     neutron subnet-create --tenant-id d9e1403b49ce466e974103b6c542badd --name vlan3 --gateway 10.10.101.1 --allocation-pool start=10.10.101.10,end=10.10.101.20 --enable-dhcp --ip-version 4 b60555a2-655e-46b7-a302-e5902ef5490e 10.10.101.0/24
+     ```
+
+4. 配置ironic-conductor服务
+
+   control01控制节点
+
+   - 修改配置文件
+
+     vim /etc/kolla/ironic-conductor/ironic.conf
+     ```shell
+     [neutron]
+     ........
+     cleaning_network = ironic-net
+     ```
+
+     - 配置说明
+       | 键               | 值             |
+       | ---------------- | -------------- |
+       | cleaning_network | vlan网络的名称 |
+
+   - 重启服务
+     ```shell
+     docker restart ironic_conductor
+     ```
+
+5. 配置ironic-dnsmasq服务
+
+   control01控制节点
+
+   - 修改配置文件
+
+     vim /etc/kolla/ironic-dnsmasq/dnsmasq.conf
+     ```shell
+     dhcp-range=10.10.101.10,10.10.101.20,96h
+     ```
+
+     - 配置说明
+       | 键         | 值                 |
+       | ---------- | ------------------ |
+       | dhcp-range | 虚机dhcp地址池范围 |
+
+   - 重启服务
+     ```shell
+     docker restart ironic_dnsmasq
+     ```
+
+6. 创建裸服务器实例化需要的nova flavor
+
+   以本次实例化为例：2核cpu，4G内存，50G硬盘，x86_64的cpu架构
+   ```shell
+   nova flavor-create --is-public true ironic-flavor auto 2048 20 2
+   nova flavor-key ironic-flavor set cpu_arch='x86_64'
+   ```
+
+7. 注册ironic节点并更新信息
+
+   - 注册节点
+     ```shell
+     ironic node-create -d pxe_ipmitool_socat -n ironic-test-01
+     ```
+
+   - 更新ipmi属性信息
+     ```shell
+     ironic node-update 62574f6c-0b10-484f-bd35-1e0594bf7c61 add driver_info/ipmi_terminal_port=8901\ driver_info/ipmi_username=admin driver_info/ipmi_address=10.10.100.251\
+     driver_info/ipmi_password=admin driver_info/ipmi_protocol_version=2.0
+     ```
+
+     - 配置说明
+       | 键                 | 值                            |
+       | ------------------ | -------------------------------- |
+       | ipmi_username      | 裸服务器ipmi登录用户名           |
+       | ipmi_password      | 裸服务器ipmi登录密码             |
+       | ipmi_address       | 裸服务器ipmi登录地址             |
+       | ipmi_terminal_port | 裸服务器ipmi对接端口（自己定义） |
+
+   - 更新资源信息
+     ```shell
+     ironic node-update 62574f6c-0b10-484f-bd35-1e0594bf7c61 add properties/memory_mb=2048\ properties/cpu_arch=x86_64 properties/local_gb=20 properties/cpus=2
+     ```
+
+   - 更新镜像信息
+     ```shell
+     ironic node-update 62574f6c-0b10-484f-bd35-1e0594bf7c61 \
+     add driver_info/deploy_kernel=76442638-de1b-47f7-a448-e405743c4baa \
+     driver_info/deploy_ramdisk=82d23138-dcd9-4580-80d7-725a2a57a70a
+     ```
+
+   - 查看裸机服务器资源信息
+     ```shell
+     nova hypervisor-list
+     nova hypervisor-show ID
+     ```
+
+     - 解除安全锁定
+       ```shell
+       ironic node-set-provision-state 62574f6c-0b10-484f-bd35-1e0594bf7c61 manage
+       ironic node-set-provision-state 62574f6c-0b10-484f-bd35-1e0594bf7c61 provide
+       ```
+
+8. 修改openstack的配额信息
+
+   - nova
+     ```shell
+     nova quota-update d9e1403b49ce466e974103b6c542badd --instance=-1 --cores=-1 --ram=-1 --metadata-items=-1 --injected-files=-1 --injected-file-content-bytes=-1 --injected-file-path-bytes=-1 --key-pairs=-1 --server-groups=-1 --server-group-members=-1
+     ```
+
+   - cinder
+     ```shell
+     cinder quota-update d9e1403b49ce466e974103b6c542badd --backup-gigabytes=-1 --backups=-1 --gigabytes=-1 --per-volume-gigabytes=-1 --snapshots=-1 --volumes=-1
+     ```
+
+   - neutron
+     ```shell
+     neutron quota-update d9e1403b49ce466e974103b6c542badd --floatingip=-1 --network=-1 --port=-1 --rbac-policy=-1 --router=-1 --security-group=-1 --security-group-rule=-1 --subnet=-1 --subnetpool=-1
+     ```
+
+9. 创建ironic的port
+   ```shell
+   ironic port-create -a 6c:92:bf:33:61:bc -n 3f8ff758-76da-4708-ac63-316c91c5f58b
+   #6c:92:bf:33:61:bc  裸金属服务器的网卡mac地址
+   ```
+
+10. 实例化一个裸服务器的节点
+    ```shell
+    nova boot --flavor 1ee0e019-8528-41fc-9194-994c0480bfef	 --image d46a0ca7-399e-4809-b68f-d8fc8ce360e7 --nic net-id=b60555a2-655e-46b7-a302-e5902ef5490e ironic-test-1
+    ```
+
+## 附录-修改主机网卡
+
+#### 1.  编辑 grub 配置文件
+
+```shell
+vim /etc/sysconfig/grub
+# 为GRUB_CMDLINE_LINUX变量增加2个参数，具体内容如下(**范围内)：
+GRUB_CMDLINE_LINUX="crashkernel=auto rd.lvm.lv=cl/root rd.lvm.lv=cl/swap **net.ifnames=0 biosdevname=0**  rhgb quiet"
+```
+
+#### 2. 重新生成 grub 配置文件
+
+```shell
+grub2-mkconfig -o /boot/grub2/grub.cfg
+然后重新启动 Linux 操作系统，通过 ip addr 可以看到网卡名称已经变为 eth0 。
+```
+
+#### 3. 修改网卡配置文件
+
+```shell
+将en***修改为eth*,并且将文件备份
+```
+
